@@ -4,20 +4,18 @@ import datetime
 import logging
 from flask import Flask, request, jsonify
 
-# Optional: Google Sheets, OpenAI, Twilio for SMS, etc.
-try:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    import openai
-    from twilio.rest import Client
-except ImportError:
-    pass
+# --- Always-required 3rd party imports ---
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from twilio.rest import Client
+import openai
 
+# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# --- Load ENV Variables (Railway) ---
+# --- ENV VARIABLES ---
 GOOGLE_SHEETS_ID   = os.environ.get('GOOGLE_SHEETS_ID')
 GOOGLE_CREDS_JSON  = os.environ.get('GOOGLE_CREDS_JSON')
 OPENAI_API_KEY     = os.environ.get('OPENAI_API_KEY')
@@ -31,16 +29,15 @@ BUSINESS_NAME      = os.environ.get('BUSINESS_NAME', 'Anthony Barragan')
 # --- Google Sheets Setup ---
 sheets_service = None
 BLOCKLIST, ALLOWLIST = set(), set()
-
-if GOOGLE_CREDS_JSON and GOOGLE_SHEETS_ID:
-    try:
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(GOOGLE_CREDS_JSON),
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        sheets_service = build('sheets', 'v4', credentials=creds)
-    except Exception as e:
-        logger.error(f"Google Sheets client init failed: {e}")
+try:
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_CREDS_JSON),
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
+    sheets_service = build('sheets', 'v4', credentials=creds)
+    logger.info("Google Sheets API initialized.")
+except Exception as e:
+    logger.warning(f"Google Sheets integration failed: {e}")
 
 def refresh_lists():
     global BLOCKLIST, ALLOWLIST
@@ -55,27 +52,30 @@ def refresh_lists():
             ).execute().get("values", [])
             ALLOWLIST = set(num[0] for num in al_vals if num)
         except Exception as e:
-            logger.warning("Could not refresh block/allow list: %s", e)
-
+            logger.warning("Block/allow list fetch failed: %s", e)
 refresh_lists()
 
-# --- SignalWire Client (for notifications) ---
+# --- SignalWire (Twilio-compatible) Client ---
 sw_client = None
 if SIGNALWIRE_PROJECT and SIGNALWIRE_TOKEN and SIGNALWIRE_SPACE:
     try:
-        sw_client = Client(SIGNALWIRE_PROJECT, SIGNALWIRE_TOKEN,
-                           signalwire_space_url=f'{SIGNALWIRE_SPACE}.signalwire.com')
+        sw_client = Client(
+            SIGNALWIRE_PROJECT, SIGNALWIRE_TOKEN,
+            signalwire_space_url=f'{SIGNALWIRE_SPACE}.signalwire.com'
+        )
     except Exception as e:
-        logger.error(f"Could not init SignalWire client: {e}")
+        logger.warning(f"SignalWire client error: {e}")
 
 # --- OpenAI API setup ---
-if OPENAI_API_KEY:
+try:
     openai.api_key = OPENAI_API_KEY
+except Exception as e:
+    logger.warning("OpenAI not configured: %s", e)
 
 def ai_screening(transcript):
     prompt = (
-        "You are a call screening assistant. Based on this transcript, "
-        "should the call be transferred, blocked, or sent to voicemail? "
+        "You are a call screening assistant. "
+        "Based on this transcript, should the call be transferred, blocked, or sent to voicemail? "
         "Reply as JSON: {'decision':'transfer/block/voicemail','caller_name':'','call_reason':''}\n"
         f"Transcript: {transcript}"
     )
@@ -86,11 +86,11 @@ def ai_screening(transcript):
             max_tokens=150,
             temperature=0
         )
-        response_txt = resp.choices[0].message.content.strip()
-        data = json.loads(response_txt)
+        data = json.loads(resp.choices[0].message.content.strip())
         return data
     except Exception as e:
-        logger.warning("OpenAI error: %s", e)
+        logger.warning("OpenAI screening error: %s", e)
+        # Fallback: go to voicemail
         return {"decision": "voicemail", "caller_name": "Unknown", "call_reason": transcript[:40]}
 
 def log_to_sheet(tab, row):
@@ -121,7 +121,6 @@ def health():
 @app.route('/')
 def index():
     return {"message": "Dynamic SignalWire Webhook Ready", "status": "success"}
-
 
 @app.route("/callflow", methods=["POST"])
 def callflow():
@@ -179,8 +178,8 @@ def process_recording():
     call_sid = request.form.get("call_sid")
     dt = datetime.datetime.utcnow().isoformat()
 
-    # (You can put your speech-to-text logic here to transcribe rec_url.)
-    transcript = f"Recording is at {rec_url} (STT integration goes here)"
+    # You could insert a real speech-to-text integration here!
+    transcript = f"Recording is at {rec_url} (add STT integration for AI)."
     ai_result = ai_screening(transcript)
     decision = ai_result.get("decision", "voicemail")
     caller_name = ai_result.get("caller_name", "Unknown")
@@ -188,8 +187,6 @@ def process_recording():
 
     # Log all
     log_to_sheet("CallLog", [dt, call_sid, from_number, decision, caller_name, call_reason, rec_url])
-
-    # Notify on transfer
     if decision == "transfer":
         send_notification(f"Incoming call from {caller_name}: {call_reason}")
 
