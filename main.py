@@ -188,15 +188,7 @@ def callflow():
                         "beep": True,
                         "format": "mp3",
                         "max_length": 45,
-                        "action": {
-                            "url": "https://flask-production-41f4.up.railway.app/process-recording",
-                            "method": "POST",
-                            "params": {
-                                "call_sid": call_sid,
-                                "from": from_num,
-                                "to": to_num
-                            }
-                        }
+                        "status_url": "https://flask-production-41f4.up.railway.app/process-recording"
                     }}
                 ]
             }
@@ -207,18 +199,14 @@ def process_recording():
     """Process the screening recording and decide what to do"""
     logger.info("=== PROCESS RECORDING HIT ===")
     
-    # SignalWire may send as form data or JSON
-    if request.is_json:
-        data = request.get_json()
-    else:
-        data = request.form.to_dict()
-    
-    logger.info(f"Recording data: {data}")
-    
-    rec_url = data.get("RecordingUrl", "")
-    from_number = data.get("from", "")
-    call_sid = data.get("call_sid", "")
+    # SignalWire sends recording data as form data
+    rec_url = request.form.get("RecordingUrl", "")
+    call_sid = request.form.get("CallSid", "")
+    from_number = request.form.get("From", "")
+    recording_sid = request.form.get("RecordingSid", "")
     dt = datetime.datetime.utcnow().isoformat()
+    
+    logger.info(f"Recording data - URL: {rec_url}, CallSid: {call_sid}, From: {from_number}")
 
     # For now, use the recording URL as transcript placeholder
     transcript = f"Recording available at {rec_url}"
@@ -269,15 +257,7 @@ def process_recording():
                         "beep": True,
                         "format": "mp3",
                         "max_length": 180,
-                        "action": {
-                            "url": "https://flask-production-41f4.up.railway.app/log-voicemail",
-                            "method": "POST",
-                            "params": {
-                                "call_sid": call_sid,
-                                "from": from_number,
-                                "caller_name": caller_name
-                            }
-                        }
+                        "status_url": "https://flask-production-41f4.up.railway.app/log-voicemail"
                     }},
                     {"hangup": {}}
                 ]
@@ -289,20 +269,14 @@ def log_voicemail():
     """Log voicemail recording"""
     logger.info("=== LOG VOICEMAIL HIT ===")
     
-    # Handle both JSON and form data
-    if request.is_json:
-        data = request.get_json()
-    else:
-        data = request.form.to_dict()
-    
-    rec_url = data.get("RecordingUrl", "")
-    from_number = data.get("from", "")
-    call_sid = data.get("call_sid", "")
-    caller_name = data.get("caller_name", from_number)
+    # SignalWire sends as form data
+    rec_url = request.form.get("RecordingUrl", "")
+    call_sid = request.form.get("CallSid", "")
+    from_number = request.form.get("From", "")
     dt = datetime.datetime.utcnow().isoformat()
     
     # Log to voicemail sheet
-    log_to_sheet("Voicemail", [dt, call_sid, from_number, caller_name, rec_url])
+    log_to_sheet("Voicemail", [dt, call_sid, from_number, from_number, rec_url])
     
     # Send notification
     send_notification(f"Voicemail from {caller_name}: {rec_url}")
