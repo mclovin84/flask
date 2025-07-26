@@ -1,12 +1,13 @@
-# main.py - Complete SignalWire webhook handler with proper indentation
+# main.py - Complete SignalWire webhook handler with proper syntax
 import os
 import json
 import datetime
 import logging
 from flask import Flask, request, jsonify
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)__)
+# Configure logging - FIXED LINE 9
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
