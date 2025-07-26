@@ -4,18 +4,17 @@ import datetime
 import logging
 from flask import Flask, request, jsonify
 
-# --- Always-required 3rd party imports ---
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from twilio.rest import Client
 import openai
 
-# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# --- ENV VARIABLES ---
+# ---------- ENVIRONMENT ----------
 GOOGLE_SHEETS_ID   = os.environ.get('GOOGLE_SHEETS_ID')
 GOOGLE_CREDS_JSON  = os.environ.get('GOOGLE_CREDS_JSON')
 OPENAI_API_KEY     = os.environ.get('OPENAI_API_KEY')
@@ -26,7 +25,7 @@ OWNER_PHONE_NUMBER = os.environ.get('OWNER_PHONE_NUMBER', '+15022969469')
 OWNER_SMS          = os.environ.get('OWNER_SMS')
 BUSINESS_NAME      = os.environ.get('BUSINESS_NAME', 'Anthony Barragan')
 
-# --- Google Sheets Setup ---
+# ---------- GOOGLE SHEETS INIT ----------
 sheets_service = None
 BLOCKLIST, ALLOWLIST = set(), set()
 try:
@@ -55,18 +54,17 @@ def refresh_lists():
             logger.warning("Block/allow list fetch failed: %s", e)
 refresh_lists()
 
-# --- SignalWire (Twilio-compatible) Client ---
+# ---------- SIGNALWIRE (Twilio-compatible) CLIENT ----------
 sw_client = None
-if SIGNALWIRE_PROJECT and SIGNALWIRE_TOKEN and SIGNALWIRE_SPACE:
-    try:
-        sw_client = Client(
-            SIGNALWIRE_PROJECT, SIGNALWIRE_TOKEN,
-            signalwire_space_url=f'{SIGNALWIRE_SPACE}.signalwire.com'
-        )
-    except Exception as e:
-        logger.warning(f"SignalWire client error: {e}")
+try:
+    sw_client = Client(
+        SIGNALWIRE_PROJECT, SIGNALWIRE_TOKEN,
+        signalwire_space=SIGNALWIRE_SPACE  # This is correct for modern signalwire SDKs
+    )
+except Exception as e:
+    logger.warning(f"SignalWire client error: {e}")
 
-# --- OpenAI API setup ---
+# ---------- OPENAI ----------
 try:
     openai.api_key = OPENAI_API_KEY
 except Exception as e:
@@ -90,7 +88,6 @@ def ai_screening(transcript):
         return data
     except Exception as e:
         logger.warning("OpenAI screening error: %s", e)
-        # Fallback: go to voicemail
         return {"decision": "voicemail", "caller_name": "Unknown", "call_reason": transcript[:40]}
 
 def log_to_sheet(tab, row):
@@ -125,11 +122,12 @@ def index():
 @app.route("/callflow", methods=["POST"])
 def callflow():
     refresh_lists()
-    data = request.json
-    call_sid = data.get("call_sid")
-    from_num = data.get("from")
+    data = request.get_json(force=True) or {}
+    call_sid = data.get("call_sid", "")
+    from_num = data.get("from", "")
     dt = datetime.datetime.utcnow().isoformat()
 
+    # Block/Allow logic
     if from_num in BLOCKLIST:
         log_to_sheet("CallLog", [dt, call_sid, from_num, "blocked", "", "blocklist"])
         return jsonify({
@@ -150,7 +148,7 @@ def callflow():
             ]}
         })
     else:
-        # Ask for name/reason, then record – for AI screening
+        # Ask, then record, then AI
         return jsonify({
             "version": "1.0.0",
             "sections": {"main": [
@@ -173,24 +171,24 @@ def callflow():
 
 @app.route("/process-recording", methods=["POST"])
 def process_recording():
-    rec_url = request.form.get("RecordingUrl")
-    from_number = request.form.get("from")
-    call_sid = request.form.get("call_sid")
+    # Try form, then JSON
+    form = request.form or {}
+    json_body = (request.get_json(force=True) or {}) if not form else {}
+    rec_url = form.get("RecordingUrl") or json_body.get("RecordingUrl", "")
+    from_number = form.get("from") or json_body.get("from", "")
+    call_sid = form.get("call_sid") or json_body.get("call_sid", "")
     dt = datetime.datetime.utcnow().isoformat()
 
-    # You could insert a real speech-to-text integration here!
     transcript = f"Recording is at {rec_url} (add STT integration for AI)."
     ai_result = ai_screening(transcript)
     decision = ai_result.get("decision", "voicemail")
     caller_name = ai_result.get("caller_name", "Unknown")
     call_reason = ai_result.get("call_reason", "")
 
-    # Log all
     log_to_sheet("CallLog", [dt, call_sid, from_number, decision, caller_name, call_reason, rec_url])
     if decision == "transfer":
         send_notification(f"Incoming call from {caller_name}: {call_reason}")
 
-    # Dynamic SWML cascade
     if decision == "transfer":
         return jsonify({
             "version": "1.0.0",
@@ -233,10 +231,12 @@ def process_recording():
 
 @app.route("/log-voicemail", methods=["POST"])
 def log_voicemail():
-    rec_url = request.form.get("RecordingUrl")
-    from_number = request.form.get("from")
-    call_sid = request.form.get("call_sid")
-    caller_name = request.form.get("caller_name") or from_number
+    form = request.form or {}
+    json_body = (request.get_json(force=True) or {}) if not form else {}
+    rec_url = form.get("RecordingUrl") or json_body.get("RecordingUrl", "")
+    from_number = form.get("from") or json_body.get("from", "")
+    call_sid = form.get("call_sid") or json_body.get("call_sid", "")
+    caller_name = form.get("caller_name") or json_body.get("caller_name") or from_number or ""
     dt = datetime.datetime.utcnow().isoformat()
     log_to_sheet("Voicemail", [dt, call_sid, from_number, caller_name, rec_url])
     send_notification(f"Voicemail from {caller_name or from_number}: {rec_url}")
