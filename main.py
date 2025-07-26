@@ -2,7 +2,7 @@ import os
 import json
 import datetime
 import logging
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -50,6 +50,7 @@ def refresh_lists():
                 spreadsheetId=GOOGLE_SHEETS_ID, range="Allowlist!A:A"
             ).execute().get("values", [])
             ALLOWLIST = set(num[0] for num in al_vals if num)
+            logger.info(f"Loaded {len(BLOCKLIST)} blocked numbers, {len(ALLOWLIST)} allowed numbers")
         except Exception as e:
             logger.warning("Block/allow list fetch failed: %s", e)
 refresh_lists()
@@ -61,12 +62,14 @@ try:
         SIGNALWIRE_PROJECT, SIGNALWIRE_TOKEN,
         signalwire_space=SIGNALWIRE_SPACE
     )
+    logger.info("SignalWire client initialized")
 except Exception as e:
     logger.warning(f"SignalWire client error: {e}")
 
 # ---------- OPENAI ----------
 try:
     openai.api_key = OPENAI_API_KEY
+    logger.info("OpenAI configured")
 except Exception as e:
     logger.warning("OpenAI not configured: %s", e)
 
@@ -99,6 +102,7 @@ def log_to_sheet(tab, row):
                 valueInputOption='RAW',
                 body={'values': [row]}
             ).execute()
+            logger.info(f"Logged to sheet {tab}: {row}")
         except Exception as e:
             logger.warning("Sheet logging error: %s", e)
 
@@ -108,6 +112,7 @@ def send_notification(msg):
             sw_client.messages.create(
                 to=OWNER_SMS, from_=OWNER_PHONE_NUMBER, body=msg[:1600]
             )
+            logger.info("SMS notification sent")
         except Exception as e:
             logger.warning("SMS notification failed: %s", e)
 
@@ -117,123 +122,198 @@ def health():
 
 @app.route('/')
 def index():
-    return {"message": "Dynamic SignalWire Webhook Ready", "status": "success"}
+    return jsonify({
+        "message": "SignalWire webhook handler", 
+        "status": "running",
+        "google_sheets": "connected" if sheets_service else "not connected",
+        "blocklist_count": len(BLOCKLIST),
+        "allowlist_count": len(ALLOWLIST)
+    })
 
 @app.route("/callflow", methods=["POST"])
 def callflow():
+    """Handle incoming call webhook from SignalWire"""
     refresh_lists()
-    # SignalWire sends data as form data, not JSON
-    call_sid = request.form.get("CallSid", "")
-    from_num = request.form.get("From", "")
+    
+    # Log incoming request for debugging
+    logger.info("=== CALLFLOW WEBHOOK HIT ===")
+    logger.info(f"Request method: {request.method}")
+    logger.info(f"Request headers: {dict(request.headers)}")
+    logger.info(f"Request data: {request.get_json()}")
+    
+    # Get JSON data from request
+    data = request.get_json() or {}
+    call_sid = data.get("CallSid", "")
+    from_num = data.get("From", "")
+    to_num = data.get("To", "")
     dt = datetime.datetime.utcnow().isoformat()
 
-    logger.info(f"Incoming call from {from_num}, SID: {call_sid}")
+    logger.info(f"Processing call from {from_num} to {to_num}, SID: {call_sid}")
 
-    # Block/Allow logic
+    # Check blocklist
     if from_num in BLOCKLIST:
-        log_to_sheet("CallLog", [dt, call_sid, from_num, "blocked", "", "blocklist"])
-        swml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Your number is blocked. Goodbye.</Say>
-    <Hangup/>
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        log_to_sheet("CallLog", [dt, call_sid, from_num, "blocked", "", "blocklist", ""])
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Your number is blocked. Goodbye.", "say_voice": "Polly.Joanna"}},
+                    {"hangup": {}}
+                ]
+            }
+        })
     
+    # Check allowlist
     elif from_num in ALLOWLIST:
-        log_to_sheet("CallLog", [dt, call_sid, from_num, "transferred", "", "allowlist"])
-        swml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Please hold, connecting you now.</Say>
-    <Dial timeout="30">
-        <Number>{OWNER_PHONE_NUMBER}</Number>
-    </Dial>
-    <Hangup/>
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        log_to_sheet("CallLog", [dt, call_sid, from_num, "transferred", "", "allowlist", ""])
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Please hold, connecting you now.", "say_voice": "Polly.Joanna"}},
+                    {"connect": {"to": OWNER_PHONE_NUMBER, "timeout": 30}},
+                    {"hangup": {}}
+                ]
+            }
+        })
     
+    # Unknown number - ask for screening info
     else:
-        # Ask for name and reason, then record
-        swml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Please state your name and reason for calling after the beep.</Say>
-    <Record 
-        action="https://flask-production-41f4.up.railway.app/process-recording"
-        method="POST"
-        maxLength="45"
-        playBeep="true"
-        recordingFormat="mp3"
-    />
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Please state your name and reason for calling after the beep.", "say_voice": "Polly.Joanna"}},
+                    {"record": {
+                        "beep": True,
+                        "format": "mp3",
+                        "max_length": 45,
+                        "action": {
+                            "url": "https://flask-production-41f4.up.railway.app/process-recording",
+                            "method": "POST",
+                            "params": {
+                                "call_sid": call_sid,
+                                "from": from_num,
+                                "to": to_num
+                            }
+                        }
+                    }}
+                ]
+            }
+        })
 
 @app.route("/process-recording", methods=["POST"])
 def process_recording():
-    rec_url = request.form.get("RecordingUrl", "")
-    from_number = request.form.get("From", "")
-    call_sid = request.form.get("CallSid", "")
+    """Process the screening recording and decide what to do"""
+    logger.info("=== PROCESS RECORDING HIT ===")
+    
+    # SignalWire may send as form data or JSON
+    if request.is_json:
+        data = request.get_json()
+    else:
+        data = request.form.to_dict()
+    
+    logger.info(f"Recording data: {data}")
+    
+    rec_url = data.get("RecordingUrl", "")
+    from_number = data.get("from", "")
+    call_sid = data.get("call_sid", "")
     dt = datetime.datetime.utcnow().isoformat()
 
-    logger.info(f"Processing recording for {from_number}")
-
-    transcript = f"Recording is at {rec_url} (add STT integration for AI)."
+    # For now, use the recording URL as transcript placeholder
+    transcript = f"Recording available at {rec_url}"
+    
+    # Get AI decision
     ai_result = ai_screening(transcript)
     decision = ai_result.get("decision", "voicemail")
     caller_name = ai_result.get("caller_name", "Unknown")
-    call_reason = ai_result.get("call_reason", "")
+    call_reason = ai_result.get("call_reason", "No reason provided")
 
+    logger.info(f"AI Decision: {decision} for {caller_name} - {call_reason}")
+
+    # Log the screening result
     log_to_sheet("CallLog", [dt, call_sid, from_number, decision, caller_name, call_reason, rec_url])
     
+    # Handle based on decision
     if decision == "transfer":
         send_notification(f"Incoming call from {caller_name}: {call_reason}")
-        swml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Thank you {caller_name}, connecting you now.</Say>
-    <Dial timeout="30">
-        <Number>{OWNER_PHONE_NUMBER}</Number>
-    </Dial>
-    <Hangup/>
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": f"say:Thank you {caller_name}, connecting you now.", "say_voice": "Polly.Joanna"}},
+                    {"connect": {"to": OWNER_PHONE_NUMBER, "timeout": 30}},
+                    {"hangup": {}}
+                ]
+            }
+        })
     
     elif decision == "block":
-        swml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">We're unable to take your call. Goodbye.</Say>
-    <Hangup/>
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:We're unable to take your call at this time. Goodbye.", "say_voice": "Polly.Joanna"}},
+                    {"hangup": {}}
+                ]
+            }
+        })
     
     else:  # voicemail
-        swml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Please leave a voicemail after the beep.</Say>
-    <Record 
-        action="https://flask-production-41f4.up.railway.app/log-voicemail"
-        method="POST"
-        maxLength="180"
-        playBeep="true"
-        recordingFormat="mp3"
-    />
-    <Hangup/>
-</Response>"""
-        return Response(swml, mimetype='text/xml')
+        return jsonify({
+            "version": "1.0.0",
+            "sections": {
+                "main": [
+                    {"play": {"url": "say:Please leave a voicemail after the beep.", "say_voice": "Polly.Joanna"}},
+                    {"record": {
+                        "beep": True,
+                        "format": "mp3",
+                        "max_length": 180,
+                        "action": {
+                            "url": "https://flask-production-41f4.up.railway.app/log-voicemail",
+                            "method": "POST",
+                            "params": {
+                                "call_sid": call_sid,
+                                "from": from_number,
+                                "caller_name": caller_name
+                            }
+                        }
+                    }},
+                    {"hangup": {}}
+                ]
+            }
+        })
 
 @app.route("/log-voicemail", methods=["POST"])
 def log_voicemail():
-    rec_url = request.form.get("RecordingUrl", "")
-    from_number = request.form.get("From", "")
-    call_sid = request.form.get("CallSid", "")
+    """Log voicemail recording"""
+    logger.info("=== LOG VOICEMAIL HIT ===")
+    
+    # Handle both JSON and form data
+    if request.is_json:
+        data = request.get_json()
+    else:
+        data = request.form.to_dict()
+    
+    rec_url = data.get("RecordingUrl", "")
+    from_number = data.get("from", "")
+    call_sid = data.get("call_sid", "")
+    caller_name = data.get("caller_name", from_number)
     dt = datetime.datetime.utcnow().isoformat()
     
-    log_to_sheet("Voicemail", [dt, call_sid, from_number, from_number, rec_url])
-    send_notification(f"Voicemail from {from_number}: {rec_url}")
+    # Log to voicemail sheet
+    log_to_sheet("Voicemail", [dt, call_sid, from_number, caller_name, rec_url])
     
-    swml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Thank you for your message. Goodbye.</Say>
-    <Hangup/>
-</Response>"""
-    return Response(swml, mimetype='text/xml')
+    # Send notification
+    send_notification(f"Voicemail from {caller_name}: {rec_url}")
+    
+    return jsonify({"status": "processed"})
+
+@app.route("/recording-complete", methods=["POST"])
+def recording_complete():
+    """Handle recording completion webhook"""
+    logger.info("Recording completed")
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
