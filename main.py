@@ -157,6 +157,7 @@ def callflow():
             "version": "1.0.0",
             "sections": {
                 "main": [
+                    {"answer": {}},
                     {"play": {"url": "say:Your number is blocked. Goodbye.", "say_voice": "Polly.Joanna"}},
                     {"hangup": {}}
                 ]
@@ -170,6 +171,7 @@ def callflow():
             "version": "1.0.0",
             "sections": {
                 "main": [
+                    {"answer": {}},
                     {"play": {"url": "say:Please hold, connecting you now.", "say_voice": "Polly.Joanna"}},
                     {"connect": {"to": OWNER_PHONE_NUMBER, "timeout": 30}},
                     {"hangup": {}}
